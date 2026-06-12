@@ -1,0 +1,16 @@
+name            = "walrus-names-gateway"
+main            = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Self-hosting on YOUR domain:
+#   1. `wrangler deploy`
+#   2. In Cloudflare DNS, add a wildcard record:
+#        Type: CNAME   Name: *   Target: walrus-names-gateway.<your-cf-account>.workers.dev   (proxied)
+#   3. In the Worker's settings, add a Custom Domain: *.yourdomain.com
+#   Every name registered on-chain is then served at <name>.yourdomain.com.
+#
+# No secrets required. The worker only reads public data:
+# Sui fullnode RPC (name registry) + the public Walrus aggregator (blobs).
+
+[vars]
+NETWORK = "mainnet"   # "mainnet" | "testnet"
