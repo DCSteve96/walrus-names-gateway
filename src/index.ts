@@ -107,9 +107,9 @@ export default {
 
     const name    = parts[0].toLowerCase()
 
-    // Reserved infrastructure subdomains: NON vanno risolti come nomi .epoch.
-    // Sono proxati attraverso questo Worker (wildcard *.epochsui.com), quindi
-    // senza questo check mostrerebbero "Site Not Found". Li reindirizziamo al sito.
+    // Reserved infrastructure subdomains: these must NOT resolve as .epoch names.
+    // They are proxied through this Worker (wildcard *.epochsui.com), so without
+    // this check they would show "Site Not Found". Redirect them to the main site.
     const RESERVED = new Set([
       'www', 'mail', 'webmail', 'autoconfig', 'autodiscover',
       'smtp', 'imap', 'pop', 'pop3', 'mx', 'ftp', 'ns1', 'ns2',
@@ -119,16 +119,17 @@ export default {
       return Response.redirect('https://epochsui.com', 301)
     }
 
-    // MCP server: proxy trasparente verso il Worker epoch-mcp.
-    // Così l'endpoint pubblico è SOLO epoch-mcp.epochsui.com (nessun workers.dev visibile)
-    // e non dipendiamo dalla precedenza custom-domain vs wildcard.
+    // MCP server: transparent proxy to the epoch-mcp Worker.
+    // The public endpoint stays epoch-mcp.epochsui.com only (no workers.dev visible)
+    // and we don't depend on custom-domain vs wildcard precedence.
+    // NOTE: Epoch-specific infrastructure — remove this block when self-hosting.
     if (name === 'mcp' || name === 'epoch-mcp') {
       const target = new URL(request.url)
       target.hostname = 'epoch-mcp.pupazzipunkapi.workers.dev'
       return fetch(new Request(target.toString(), request))
     }
 
-    // Verified Vault badge: proxy trasparente verso il Worker epoch-badge.
+    // Verified Vault badge: transparent proxy to the epoch-badge Worker.
     // Endpoint pubblico: epoch-badge.epochsui.com/badge/<id>.svg e /embed/<id>.
     if (name === 'epoch-badge' || name === 'badge') {
       const target = new URL(request.url)
@@ -136,7 +137,7 @@ export default {
       return fetch(new Request(target.toString(), request))
     }
 
-    // Ecosystem brain: proxy trasparente verso il Worker epoch-ecosystem.
+    // Ecosystem brain: transparent proxy to the epoch-ecosystem Worker.
     // Endpoint pubblico: ecosystem.epochsui.com
     if (name === 'ecosystem' || name === 'epoch-ecosystem') {
       const target = new URL(request.url)
@@ -157,9 +158,9 @@ export default {
     }
 
     // 1. Resolve name → blob_id on-chain.
-    //    Fallback: il sottodominio può essere un object ID in Base36
-    //    (<objectid-base36>.epochsui.com, come i portal Walrus Sites) →
-    //    il sito è raggiungibile anche senza passare dal lookup del nome.
+    //    Fallback: the subdomain may be a Base36-encoded object ID
+    //    (<objectid-base36>.epochsui.com, like Walrus Sites portals) →
+    //    the site stays reachable without going through the name lookup.
     let blobId = ''
     try {
       blobId = await resolveName(cfg.rpc, cfg.packageId, cfg.registryId, name)
@@ -184,8 +185,8 @@ export default {
       return notFound('Blob not found on Walrus.')
     }
 
-    // 3. Manifest? → sito multi-pagina: risolvi il pathname richiesto e servi
-    //    il blob corrispondente. I blob non-manifest restano single-page (legacy).
+    // 3. Manifest? → multi-page site: resolve the requested pathname and serve
+    //    the matching blob. Non-manifest blobs remain single-page (legacy).
     const manifest = parseManifest(blob.content)
     if (manifest) {
       return serveFromManifest(manifest, url.pathname, cfg.walrusAggregator, name, blobId)
@@ -223,22 +224,22 @@ async function fetchBlob(
 }
 
 /* ── Multi-page manifest ─────────────────────────────────────────
- * Un sito multi-pagina è un blob JSON con questa shape:
+ * A multi-page site is a JSON blob with this shape:
  *   {
  *     "epoch-manifest": 1,
  *     "routes": { "/": "<blobId>", "/about": "<blobId>", "/style.css": "<blobId>" },
- *     "404": "<blobId>"            // opzionale, pagina not-found custom
+ *     "404": "<blobId>"            // optional, custom not-found page
  *   }
- * Il Content-Type è dedotto dall'estensione del path ("/about" → html).
- * Retrocompatibile: blob non-JSON (o JSON senza "epoch-manifest") = sito
- * single-page servito così com'è. */
+ * The Content-Type is inferred from the path extension ("/about" → html).
+ * Backwards compatible: a non-JSON blob (or JSON without "epoch-manifest")
+ * is served as-is as a single-page site. */
 
 interface SiteManifest {
   routes:   Record<string, string>
   notFound?: string
 }
 
-const MANIFEST_MAX_BYTES = 256 * 1024 // un manifest più grande di così non è un manifest
+const MANIFEST_MAX_BYTES = 256 * 1024 // anything bigger than this is not a manifest
 
 function parseManifest(content: ArrayBuffer): SiteManifest | null {
   if (content.byteLength > MANIFEST_MAX_BYTES) return null
@@ -266,7 +267,7 @@ const MIME_BY_EXT: Record<string, string> = {
 
 function mimeFromPath(path: string): string {
   const ext = path.includes('.') ? path.split('.').pop()!.toLowerCase() : ''
-  return MIME_BY_EXT[ext] ?? 'text/html; charset=utf-8' // path senza estensione = pagina html
+  return MIME_BY_EXT[ext] ?? 'text/html; charset=utf-8' // extension-less path = html page
 }
 
 async function serveFromManifest(
@@ -276,22 +277,22 @@ async function serveFromManifest(
   name:       string,
   rootBlobId: string,
 ): Promise<Response> {
-  // Normalizza: senza trailing slash (tranne root), decodifica %xx
+  // Normalize: strip trailing slash (except root), decode %xx
   let path = decodeURIComponent(rawPath)
   if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1)
   if (!path.startsWith('/')) path = '/' + path
 
-  // Lookup: esatto → variante .html → index annidato
+  // Lookup: exact → .html variant → nested index
   const target =
     manifest.routes[path] ??
     manifest.routes[`${path}.html`] ??
     manifest.routes[`${path}/index.html`] ??
-    // link scritti con .html ma route registrata senza estensione (es. /portfolio.html → /portfolio)
+    // links written with .html but route registered without extension (e.g. /portfolio.html → /portfolio)
     (path.endsWith('.html') ? manifest.routes[path.replace(/\.html$/, '')] ?? (path === '/index.html' ? manifest.routes['/'] : undefined) : undefined) ??
     (path === '/' ? manifest.routes['/index.html'] : undefined)
 
   if (!target) {
-    // 404 custom del sito, se presente
+    // site's custom 404, if present
     if (manifest.notFound) {
       const nf = await fetchBlob(aggregator, manifest.notFound)
       if (nf) return new Response(nf.content, {
@@ -319,15 +320,15 @@ async function serveFromManifest(
 }
 
 /* ── Base36 objectID resolution ──────────────────────────────────
- * I sottodomini DNS non ammettono "0x" né maiuscole, quindi (come i portal
- * Walrus Sites) un object ID può essere codificato in Base36:
+ * DNS subdomains allow neither "0x" nor uppercase, so (like the Walrus
+ * Sites portals) an object ID can be encoded in Base36:
  *   <objectid-base36>.epochsui.com
- * Supportiamo sia l'oggetto NameCap (ha il campo `name` → lookup nel registry)
- * sia oggetti che espongono direttamente `blob_id`. */
+ * We support both the NameCap object (has a `name` field → registry lookup)
+ * and objects exposing `blob_id` directly. */
 
 function base36ToObjectId(s: string): string {
-  // Un object ID di 32 byte in Base36 è ~45-50 caratteri, solo [0-9a-z].
-  // I nomi .epoch normali sono molto più corti → niente ambiguità in pratica.
+  // A 32-byte object ID in Base36 is ~45-50 chars, [0-9a-z] only.
+  // Normal .epoch names are much shorter → no ambiguity in practice.
   if (s.length < 40 || s.length > 52 || !/^[0-9a-z]+$/.test(s)) return ''
   let n = 0n
   for (const c of s) n = n * 36n + BigInt(parseInt(c, 36))
@@ -355,12 +356,12 @@ async function resolveObjectId(
   const fields = json.result?.data?.content?.fields
   if (!fields) return ''
 
-  // Oggetto col blob_id diretto (es. NameRecord wrappato in dynamic field)
+  // Object with a direct blob_id (e.g. NameRecord wrapped in a dynamic field)
   if (typeof fields.blob_id === 'string' && fields.blob_id) return fields.blob_id
   const nested = fields.value?.fields
   if (nested && typeof nested.blob_id === 'string' && nested.blob_id) return nested.blob_id
 
-  // NameCap: ha il campo `name` → risolvi via registry
+  // NameCap: has a `name` field → resolve via registry
   const nm = typeof fields.name === 'string' ? fields.name : (typeof nested?.name === 'string' ? nested.name : '')
   if (nm && isValidName(nm)) return resolveName(rpc, packageId, registryId, nm)
 
