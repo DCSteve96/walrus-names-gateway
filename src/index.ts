@@ -15,6 +15,8 @@
  *   Then add Custom Domain *.epochsui.com in Worker settings
  */
 
+import { getObjectJson, resolveNameBlob } from './sui'
+
 export interface Env {
   NETWORK: string  // "testnet" | "mainnet"
 }
@@ -343,26 +345,15 @@ async function resolveObjectId(
   registryId: string,
   objectId:   string,
 ): Promise<string> {
-  const res = await fetch(rpc, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({
-      jsonrpc: '2.0', id: 1,
-      method:  'sui_getObject',
-      params:  [objectId, { showContent: true }],
-    }),
-  })
-  const json   = await res.json() as any
-  const fields = json.result?.data?.content?.fields
-  if (!fields) return ''
+  // gRPC json flattens nested UIDs; a NameRecord = { blob_id, owner }, a NameCap = { id, name }.
+  const j = await getObjectJson(rpc, objectId)
+  if (!j) return ''
 
-  // Object with a direct blob_id (e.g. NameRecord wrapped in a dynamic field)
-  if (typeof fields.blob_id === 'string' && fields.blob_id) return fields.blob_id
-  const nested = fields.value?.fields
-  if (nested && typeof nested.blob_id === 'string' && nested.blob_id) return nested.blob_id
+  if (typeof j.blob_id === 'string' && j.blob_id) return j.blob_id
+  if (typeof j.value?.blob_id === 'string' && j.value.blob_id) return j.value.blob_id
 
   // NameCap: has a `name` field → resolve via registry
-  const nm = typeof fields.name === 'string' ? fields.name : (typeof nested?.name === 'string' ? nested.name : '')
+  const nm = typeof j.name === 'string' ? j.name : (typeof j.value?.name === 'string' ? j.value.name : '')
   if (nm && isValidName(nm)) return resolveName(rpc, packageId, registryId, nm)
 
   return ''
@@ -379,52 +370,12 @@ async function resolveObjectId(
  */
 async function resolveName(
   rpc:        string,
-  packageId:  string,
+  _packageId: string,
   registryId: string,
   name:       string,
 ): Promise<string> {
-  // Step 1: fetch Registry to get the Table's internal object ID
-  const regRes  = await fetch(rpc, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({
-      jsonrpc: '2.0', id: 1,
-      method:  'sui_getObject',
-      params:  [registryId, { showContent: true }],
-    }),
-  })
-  const regJson = await regRes.json() as any
-  const tableId = regJson.result?.data?.content?.fields?.records?.fields?.id?.id
-  if (!tableId) return ''
-
-  // Step 2: query the dynamic field on the Table's internal ID
-  const body = {
-    jsonrpc: '2.0',
-    id:      2,
-    method:  'suix_getDynamicFieldObject',
-    params:  [
-      tableId,
-      {
-        type:  '0x1::string::String',
-        value: name,
-      },
-    ],
-  }
-
-  const res  = await fetch(rpc, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
-  })
-  const json = await res.json() as any
-
-  if (json.error || !json.result?.data) return ''
-
-  // The NameRecord fields are nested inside the dynamic field's content
-  const fields = json.result.data?.content?.fields?.value?.fields
-  if (!fields) return ''
-
-  return fields.blob_id ?? ''
+  // Registry records Table → NameRecord.blob_id (gRPC helper, verified shapes).
+  return await resolveNameBlob(rpc, registryId, name)
 }
 
 /* ── Helpers ─────────────────────────────────────────────────── */
