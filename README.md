@@ -70,6 +70,8 @@ Then in the Cloudflare dashboard:
 
 Done — `<name>.yourdomain.com` now serves every registered `.epoch` site. Switch `NETWORK = "testnet"` in `wrangler.toml` to point at the testnet registry.
 
+**Your domain needs no code change.** The worker takes the name from the first label of whatever hostname reaches it, so `epochsui.com` appears nowhere in the resolution path: the same source serves `alice.epochsui.com` and `alice.yourdomain.com` identically, off the same on-chain records. The only requirement is at least three labels, so host it on a subdomain of your domain (`*.yourdomain.com`), not on the apex.
+
 **No secrets, no database, no state.** The worker reads two public sources: a Sui fullnode and the public Walrus aggregator (both endpoints are in `CONTRACTS` at the top of `src/index.ts` — swap in your own fullnode/aggregator if you prefer).
 
 ## Adapting for your own deployment
