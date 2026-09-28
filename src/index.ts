@@ -16,9 +16,26 @@
  */
 
 import { getObjectJson, resolveNameBlob } from './sui'
+import { qrPng } from './qrpng'
 
 export interface Env {
   NETWORK: string  // "testnet" | "mainnet"
+  /** PNG renderer for name cards (Supabase Edge Function, satori + resvg). Optional: SVG fallback without it. */
+  OG_RENDERER?: string
+  /** Supabase publishable key: read-only, for the creator page of a drop (`drop_meta`). Optional. */
+  SUPABASE_ANON?: string
+  /** Origin of the draft worker, for preview.<domain>. Optional: without it that route is off. */
+  DRAFT_ORIGIN?: string
+  /** Service binding to the same worker, preferred over DRAFT_ORIGIN when present. */
+  WALRUS?: { fetch: (req: Request) => Promise<Response> }
+  /** Origin of the farm worker, for farm.<domain>. Optional: without it that route is off. */
+  FARM_ORIGIN?: string
+  /** Service binding to the farm worker, preferred over FARM_ORIGIN when present. */
+  FARM?: { fetch: (req: Request) => Promise<Response> }
+  /** Origin of the x402 facilitator worker, for x402.<domain>. Optional: without it that route is off. */
+  X402_ORIGIN?: string
+  /** Service binding to the facilitator worker, preferred over X402_ORIGIN when present. */
+  X402?: { fetch: (req: Request) => Promise<Response> }
 }
 
 /* ── On-chain constants ──────────────────────────────────────── */
@@ -95,10 +112,34 @@ export default {
 
     // OG image route: og.epochsui.com/:name or /og/:name
     if (hostname.startsWith('og.') || url.pathname.startsWith('/og/')) {
-      const name = hostname.startsWith('og.')
+      const name = (hostname.startsWith('og.')
         ? url.pathname.replace(/^\//, '').split('/')[0] || 'epoch'
-        : url.pathname.replace('/og/', '').split('/')[0] || 'epoch'
-      return generateOgImage(name.toLowerCase().replace(/[^a-z0-9-]/g, ''))
+        : url.pathname.replace('/og/', '').split('/')[0] || 'epoch').toLowerCase().replace(/[^a-z0-9-]/g, '')
+      // PNG dal renderer esterno (Supabase Edge Function `og-name`, satori +
+      // resvg-wasm): gli explorer NFT (SuiVision) non rasterizzano SVG e
+      // mostravano l'icona generica per i NameCap. Rasterizzare qui sforerebbe
+      // la CPU del piano free. Cache di un giorno all'edge; `?format=svg` o
+      // renderer giù → SVG di prima.
+      if (url.searchParams.get('format') !== 'svg') {
+        const renderer = (env.OG_RENDERER || 'https://bgbyobyqzxmycatboyug.supabase.co/functions/v1/og-name').replace(/\/$/, '')
+        const cacheKey = new Request(`https://og.epochsui.com/${name}`, { method: 'GET' })
+        const cache = (caches as any).default as Cache
+        const hit = await cache.match(cacheKey)
+        if (hit) return hit
+        try {
+          const up = await fetch(`${renderer}?name=${encodeURIComponent(name)}`, { cf: { cacheTtl: 86400, cacheEverything: true } } as any)
+          if (up.ok && (up.headers.get('content-type') ?? '').startsWith('image/')) {
+            const res = new Response(await up.arrayBuffer(), { headers: {
+              'Content-Type': 'image/png',
+              'Cache-Control': 'public, max-age=86400',
+              'Access-Control-Allow-Origin': '*',
+            } })
+            await cache.put(cacheKey, res.clone())
+            return res
+          }
+        } catch { /* renderer irraggiungibile: SVG */ }
+      }
+      return generateOgImage(name)
     }
 
     // Extract the subdomain (everything before the first dot)
@@ -147,6 +188,271 @@ export default {
       return fetch(new Request(target.toString(), request))
     }
 
+    // x402 facilitator: x402.epochsui.com
+    // Public on purpose and the whole worker is exposed: /supported, /verify,
+    // /settle and the paid demo. It holds no key and no funds (it only broadcasts
+    // transactions the payer already signed), so there is no private endpoint to
+    // keep off a friendly name. Method, headers (PAYMENT-SIGNATURE) and body pass
+    // through untouched; CORS and caching are the worker's business.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (name === 'x402') {
+      if (!env.X402 && !env.X402_ORIGIN) return new Response('x402 facilitator not configured', { status: 503 })
+      const origin = (env.X402_ORIGIN || 'https://epoch-x402.pupazzipunkapi.workers.dev').replace(/\/+$/, '')
+      const req = new Request(origin + url.pathname + url.search, request)
+      return env.X402 ? env.X402.fetch(req) : fetch(req)
+    }
+
+    // Farm: farm.epochsui.com/state, /proof/<address> e /lp/<address>
+    //
+    // Sono le due letture che la pagina `/farm` fa per dire a qualcuno quanto ha
+    // maturato, quindi vale la stessa ragione dei blob: quell'URL sta dentro il
+    // frontend e un host workers.dev lì è la nostra idraulica a vista. Un nome
+    // nostro lo ripuntiamo altrove il giorno che serve.
+    // **Volutamente stretta**: solo queste due letture in GET. `/run/snapshot` e
+    // `/run/publish` firmano transazioni e si autenticano con un segreto nella
+    // query, quindi restano sull'host diretto: un segreto che viaggia in un URL
+    // non guadagna niente da un nome amichevole, e questo giro lo farebbe finire
+    // anche nei log di un hop in più.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (name === 'farm') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } })
+      }
+      // Two farms share this worker (EPT and BARA), so the same three reads
+      // exist twice: bare paths are the first farm, `/f/<key>/…` picks one by
+      // name. `/farms` just lists what exists. Everything else is redirected:
+      // the run endpoints sign transactions and authenticate with a secret in
+      // the query string, which gains nothing from a friendly name and would
+      // only end up in one more log.
+      const p = url.pathname
+      const reads = /^(\/state|\/farms|\/(proof|lp)\/0x[0-9a-fA-F]{1,64})$/
+      const ok = reads.test(p) || /^\/f\/[a-z0-9-]{1,16}(\/state|\/(proof|lp)\/0x[0-9a-fA-F]{1,64})$/.test(p)
+      if (!ok) return Response.redirect('https://epochsui.com/farm', 302)
+      const origin = (env.FARM_ORIGIN || 'https://epoch-farm.pupazzipunkapi.workers.dev').replace(/\/+$/, '')
+      const req = new Request(origin + p, { method: request.method })
+      const upstream = env.FARM ? await env.FARM.fetch(req) : await fetch(req)
+      const h = new Headers(upstream.headers)
+      // Cambia a ogni radice e a ogni ritiro: una risposta cachata qui vorrebbe
+      // dire mostrare a qualcuno un credito che non è più quello.
+      h.set('Cache-Control', 'no-store')
+      h.set('X-Content-Type-Options', 'nosniff')
+      return new Response(upstream.body, { status: upstream.status, headers: h })
+    }
+
+    // Blobs: blob.epochsui.com/<blobId>
+    // Same bytes the Walrus aggregators serve, read through our worker (it tries
+    // several aggregators, sniffs the content type and keeps CORS open). This
+    // route exists so those URLs can say epochsui.com: they end up in `<img src>`
+    // of pages we serve and in template covers, and a workers.dev host in there
+    // is our plumbing leaking into someone else's page.
+    // Deliberately narrow: only this one read-only path is exposed, not the
+    // whole worker. The upload endpoint spends our WAL and the drafts API is
+    // guarded by a secret id, and neither gains anything from a friendly name.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (name === 'blob') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } })
+      }
+      const id = url.pathname.replace(/^\/+/, '')
+      // Blob id base64url: se non lo è, non è una nostra richiesta e non la si
+      // gira a nessuno. Niente path, niente query, niente da inoltrare.
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) {
+        return Response.redirect('https://names.epochsui.com', 302)
+      }
+      const origin = (env.DRAFT_ORIGIN || 'https://epoch-walrus.pupazzipunkapi.workers.dev').replace(/\/+$/, '')
+      const req = new Request(`${origin}/walrus-blob/${id}`, { method: request.method })
+      const upstream = env.WALRUS ? await env.WALRUS.fetch(req) : await fetch(req)
+      const h = new Headers(upstream.headers)
+      // Un blob id è il contenuto: non cambia mai, quindi si cacha per sempre.
+      h.set('Cache-Control', 'public, max-age=31536000, immutable')
+      h.set('X-Content-Type-Options', 'nosniff')
+      return new Response(upstream.body, { status: upstream.status, headers: h })
+    }
+
+    // Draft previews: preview.epochsui.com/<draftId>[/<page path>]
+    //
+    // Why a subdomain of its own: a draft is HTML written by whoever is using
+    // the builder, and that must never run on the origin that answers the API
+    // calls. Same-origin would mean that page can call those endpoints as if it
+    // were us and read what they return. Here it is a separate origin, so the
+    // browser treats it like any other stranger's site.
+    // The draft worker only serves the HTML to a request carrying the marker
+    // header below, and redirects anyone else here. A browser navigation cannot
+    // set headers, so nothing can make a person's browser run that HTML on the
+    // API origin, which is the case that matters.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (name === 'preview') {
+      const origin = (env.DRAFT_ORIGIN || 'https://epoch-walrus.pupazzipunkapi.workers.dev').replace(/\/+$/, '')
+      const segs = url.pathname.split('/').filter(Boolean)
+      // Two things live here: drafts at /<draftId> and marketplace templates at
+      // /t/<templateId>. Same reason for both, the HTML is written by someone
+      // else and must not run on the origin that answers the API calls.
+      const isTemplate = segs[0] === 't'
+      const id   = (isTemplate ? segs[1] : segs[0]) ?? ''
+      // Landing on the bare host, or an id that is not one: back to the builder.
+      if (!/^[0-9a-fA-F-]{16,64}$/.test(id)) return Response.redirect('https://names.epochsui.com/build', 302)
+      const path = '/' + segs.slice(isTemplate ? 2 : 1).join('/')
+      const route = isTemplate ? 'template-page' : 'draft-page'
+      const target = `${origin}/${route}/${encodeURIComponent(id)}?path=${encodeURIComponent(path)}`
+      const req = new Request(target, { method: 'GET', headers: { 'X-Epoch-Preview': '1' } })
+      const upstream = env.WALRUS ? await env.WALRUS.fetch(req) : await fetch(req)
+      const h = new Headers(upstream.headers)
+      // Una bozza cambia sotto le mani di chi la guarda, un template no: quello
+      // che risponde il worker per i template è già cachabile, e non va coperto.
+      if (!isTemplate) h.set('Cache-Control', 'no-store')
+      h.set('X-Robots-Tag', 'noindex, nofollow')
+      h.set('X-Content-Type-Options', 'nosniff')
+      h.set('Referrer-Policy', 'no-referrer')
+      return new Response(upstream.body, { status: upstream.status, headers: h })
+    }
+
+    // Pay links: send.epochsui.com/<name>?amount=&coin=&for=&nonce=
+    // claim.epochsui.com/<dropId>: the claim page of an Epoch Drop, served by the
+    // vesting app (Cloudflare Pages). The SPA sees the `claim.` host and mounts
+    // `/:id` on the drop page, so the shared link stays short. Link previews are
+    // rewritten at the edge with the drop's own title, read from chain.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (name === 'claim') {
+      const target = new URL(request.url)
+      target.hostname = 'epoch-vesting.pages.dev'
+      target.protocol = 'https:'
+      const upstream = await fetch(new Request(target.toString(), request), { redirect: 'follow' })
+      const ct = upstream.headers.get('content-type') ?? ''
+      if (!ct.includes('text/html')) return upstream
+
+      const dropId = (url.pathname.split('/')[1] ?? '').toLowerCase()
+      const isDrop = /^0x[0-9a-f]{64}$/.test(dropId)
+      let title = 'Epoch Drops: an airdrop that vests'
+      let desc = 'One vault, many wallets. Each recipient claims their share as it unlocks, from a Move object nobody can edit.'
+      let bannerUrl: string | null = null
+      if (isDrop) {
+        // Best effort: a failed read leaves the generic preview, never breaks the page.
+        const j = await getObjectJson('https://fullnode.mainnet.sui.io:443', dropId)
+        const t = String(j?.title ?? '').trim().slice(0, 64)
+        const n = Number(j?.recipients ?? 0)
+        if (t) {
+          title = `${t}: claim your share · Epoch Drops`
+          desc = `${n ? `${n.toLocaleString('en-US')} wallets. ` : ''}Connect the wallet on the list and claim what has vested. The list and the schedule are on chain and cannot be changed.`
+        }
+        // The creator's page (banner + description) lives on Walrus, with the
+        // pointer in a public Supabase table. Best effort too: no key, no row or
+        // a slow read all leave the generic image.
+        if (env.SUPABASE_ANON) {
+          try {
+            const r = await fetch(
+              `https://bgbyobyqzxmycatboyug.supabase.co/rest/v1/drop_meta?select=banner_blob,description&network=eq.mainnet&drop_id=eq.${dropId}`,
+              { headers: { apikey: env.SUPABASE_ANON, Authorization: `Bearer ${env.SUPABASE_ANON}` }, signal: AbortSignal.timeout(2500) })
+            const rows = r.ok ? await r.json() as Array<{ banner_blob?: string | null; description?: string | null }> : []
+            const row = rows[0]
+            if (row?.banner_blob && /^[A-Za-z0-9_-]{40,50}$/.test(row.banner_blob)) bannerUrl = `https://blob.epochsui.com/${row.banner_blob}`
+            const d = String(row?.description ?? '').replace(/\s+/g, ' ').trim()
+            if (d) desc = d.length > 200 ? `${d.slice(0, 197)}…` : d
+          } catch { /* generic preview */ }
+        }
+      }
+      const pageUrl = `https://claim.epochsui.com${url.pathname}`
+      const image = bannerUrl ?? 'https://epochsui.com/og-image.png'
+      const meta: Record<string, string> = {
+        'meta[name="description"]': desc,
+        'meta[property="og:title"]': title,
+        'meta[property="og:description"]': desc,
+        'meta[property="og:image"]': image,
+        'meta[property="og:url"]': pageUrl,
+        'meta[name="twitter:title"]': title,
+        'meta[name="twitter:description"]': desc,
+        'meta[name="twitter:image"]': image,
+        'meta[name="twitter:card"]': 'summary_large_image',
+      }
+      let rw = new HTMLRewriter()
+        .on('title', { element(e) { e.setInnerContent(title) } })
+        .on('link[rel="canonical"]', { element(e) { e.setAttribute('href', pageUrl) } })
+      for (const [sel, val] of Object.entries(meta)) {
+        rw = rw.on(sel, { element(e) { e.setAttribute('content', val) } })
+      }
+      const res = rw.transform(upstream)
+      const h = new Headers(res.headers)
+      h.set('cache-control', 'public, max-age=60')
+      return new Response(res.body, { status: res.status, headers: h })
+    }
+
+    // Transparent proxy to the names app (Cloudflare Pages origin). The SPA
+    // sees the `send.` host and mounts only the payment routes (`/`, `/:name`),
+    // so the path stays clean: no `/pay/` prefix on this domain.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (name === 'send') {
+      // /qr.png?u=<url>: QR as a real PNG, used as og:image of a request so the
+      // link preview in Telegram/X/WhatsApp shows the code. Only our own URLs.
+      if (url.pathname === '/qr.png') {
+        const u = url.searchParams.get('u') ?? ''
+        const ok = u.startsWith('https://send.epochsui.com/') || u.startsWith('https://my.slush.app/browse/')
+        if (!ok || u.length > 1500) return new Response('Bad request', { status: 400 })
+        const png = await qrPng(u, 640)
+        return new Response(png, { headers: { 'content-type': 'image/png', 'cache-control': 'public, max-age=31536000, immutable' } })
+      }
+
+      const target = new URL(request.url)
+      target.hostname = 'walrus-names-frontend.pages.dev'
+      // Always https + follow redirects. The incoming Worker request carries
+      // `redirect: "manual"`: with an http:// link the Pages origin answered a
+      // 301 to https://…pages.dev, we passed it through, and X rendered the
+      // card with the pages.dev domain instead of send.epochsui.com.
+      target.protocol = 'https:'
+      const upstream = await fetch(new Request(target.toString(), request), { redirect: 'follow' })
+      const ct = upstream.headers.get('content-type') ?? ''
+      if (!ct.includes('text/html')) return upstream
+
+      // Link previews: the SPA's index.html carries the Epoch Names meta.
+      // Rewrite them at the edge so a shared pay link shows Epoch Pay and,
+      // when the path is a name, that name.
+      const payName = (url.pathname.split('/')[1] ?? '').toLowerCase()
+      const isName = /^[a-z0-9-]{3,}$/.test(payName)
+      // Richiesta con importo: titolo con la cifra e QR come immagine, così il
+      // messaggio condiviso (Telegram, X, WhatsApp) mostra importo e codice.
+      const amount = (url.searchParams.get('amount') ?? '').trim()
+      const coinP  = (url.searchParams.get('coin') ?? 'SUI').trim()
+      const reason = (url.searchParams.get('for') ?? '').trim().slice(0, 80)
+      const isRequest = isName && /^\d*\.?\d+$/.test(amount) && Number(amount) > 0
+      const coinLabel = /^[A-Za-z0-9]{1,12}$/.test(coinP) ? coinP.toUpperCase() : (coinP.split('::').pop() ?? 'tokens').slice(0, 12)
+      const pageUrl = `https://send.epochsui.com${url.pathname}${isRequest ? url.search : ''}`
+      const slushUrl = `https://my.slush.app/browse/${encodeURIComponent(pageUrl)}`
+      const title = isRequest
+        ? `Pay ${amount} ${coinLabel} to ${payName}.epoch`
+        : isName ? `Pay ${payName}.epoch · Epoch Pay` : 'Epoch Pay: get paid at your .epoch name'
+      const desc  = isRequest
+        ? `${reason ? `${reason}. ` : ''}Pay with any token on Sui: the swap runs inside the payment, with an on-chain receipt. Scan the code with your phone to open it in Slush.`
+        : isName
+          ? `Pay ${payName}.epoch in SUI, USDC, EPT or any token on Sui. Swap inside the payment, on-chain receipt through the Sui Payment Kit.`
+          : 'Your .epoch name is a payment link. Ask for any token on Sui, the payer can spend a different one: the swap runs inside the payment, with an on-chain receipt.'
+      const image = isRequest
+        ? `https://send.epochsui.com/qr.png?u=${encodeURIComponent(slushUrl)}`
+        : 'https://send.epochsui.com/og-pay.png'
+      const meta: Record<string, string> = {
+        'meta[name="description"]': desc,
+        'meta[property="og:title"]': title,
+        'meta[property="og:description"]': desc,
+        'meta[property="og:image"]': image,
+        'meta[property="og:url"]': pageUrl,
+        'meta[name="twitter:title"]': title,
+        'meta[name="twitter:description"]': desc,
+        'meta[name="twitter:image"]': image,
+        // QR quadrato: card "summary" (miniatura a lato), non la grande 1.91:1
+        'meta[name="twitter:card"]': isRequest ? 'summary' : 'summary_large_image',
+      }
+      let rw = new HTMLRewriter()
+        .on('title', { element(e) { e.setInnerContent(title) } })
+        .on('link[rel="canonical"]', { element(e) { e.setAttribute('href', pageUrl) } })
+        // Identità della dApp nei wallet: nome "Epoch Pay" e manifest dedicato (stesse icone)
+        .on('meta[name="application-name"]', { element(e) { e.setAttribute('content', 'Epoch Pay') } })
+        .on('link[rel="manifest"]', { element(e) { e.setAttribute('href', '/pay.webmanifest') } })
+      for (const [sel, val] of Object.entries(meta)) {
+        rw = rw.on(sel, { element(e) { e.setAttribute('content', val) } })
+      }
+      const res = rw.transform(upstream)
+      const h = new Headers(res.headers)
+      h.set('cache-control', 'public, max-age=60')
+      return new Response(res.body, { status: res.status, headers: h })
+    }
+
     const network = (env.NETWORK === 'mainnet' ? 'mainnet' : 'testnet') as 'mainnet' | 'testnet'
     const cfg     = CONTRACTS[network]
 
@@ -157,6 +463,14 @@ export default {
     // Validate name format (same rules as the contract)
     if (!isValidName(name)) {
       return notFound(`"${name}" is not a valid .epoch name.`)
+    }
+
+    // <name>.epochsui.com/pay[?amount=&coin=&for=&nonce=]: the payment page for
+    // this name lives on send.epochsui.com (it needs a wallet), so the gateway
+    // just forwards there with the query intact. `/pay` is reserved for every site.
+    // NOTE: Epoch-specific route: drop or repoint it when self-hosting.
+    if (url.pathname === '/pay' || url.pathname === '/pay/') {
+      return Response.redirect(`https://send.epochsui.com/${name}${url.search}`, 302)
     }
 
     // 1. Resolve name → blob_id on-chain.
@@ -184,7 +498,11 @@ export default {
     // 2. Fetch blob from Walrus
     const blob = await fetchBlob(cfg.walrusAggregator, blobId)
     if (!blob) {
-      return notFound('Blob not found on Walrus.')
+      // The name resolved, so it IS registered and owned: this is a content
+      // problem, not a free name. Saying "not found, go register it" here was
+      // wrong twice over, since it invited a visitor to buy something that is
+      // not for sale and it hid the real cause from the owner.
+      return siteUnavailable(name)
     }
 
     // 3. Manifest? → multi-page site: resolve the requested pathname and serve
@@ -230,15 +548,20 @@ async function fetchBlob(
  *   {
  *     "epoch-manifest": 1,
  *     "routes": { "/": "<blobId>", "/about": "<blobId>", "/style.css": "<blobId>" },
- *     "404": "<blobId>"            // optional, custom not-found page
- *   }
+ *     "404": "<blobId>",           // optional, custom not-found page
+ *     "fallback": "/"              // optional, SPA: unknown extension-less
+ *   }                              //   paths serve this route (or blobId) with 200
  * The Content-Type is inferred from the path extension ("/about" → html).
  * Backwards compatible: a non-JSON blob (or JSON without "epoch-manifest")
- * is served as-is as a single-page site. */
+ * is served as-is as a single-page site.
+ * `fallback` exists for data-driven sites (the Sessions hub) whose pages
+ * like /session/<id> are rendered client-side from a JSON route: they need
+ * a real 200, not a custom 404, so crawlers and share previews work. */
 
 interface SiteManifest {
   routes:   Record<string, string>
   notFound?: string
+  fallback?: string   // a route path ("/") or a blobId
 }
 
 const MANIFEST_MAX_BYTES = 256 * 1024 // anything bigger than this is not a manifest
@@ -250,7 +573,11 @@ function parseManifest(content: ArrayBuffer): SiteManifest | null {
     const j    = JSON.parse(text)
     if (!j || typeof j !== 'object' || !j['epoch-manifest']) return null
     if (!j.routes || typeof j.routes !== 'object') return null
-    return { routes: j.routes as Record<string, string>, notFound: typeof j['404'] === 'string' ? j['404'] : undefined }
+    return {
+      routes:   j.routes as Record<string, string>,
+      notFound: typeof j['404'] === 'string' ? j['404'] : undefined,
+      fallback: typeof j.fallback === 'string' ? j.fallback : undefined,
+    }
   } catch {
     return null
   }
@@ -293,6 +620,24 @@ async function serveFromManifest(
     (path.endsWith('.html') ? manifest.routes[path.replace(/\.html$/, '')] ?? (path === '/index.html' ? manifest.routes['/'] : undefined) : undefined) ??
     (path === '/' ? manifest.routes['/index.html'] : undefined)
 
+  if (!target && manifest.fallback && !path.includes('.')) {
+    // SPA fallback: a route path ("/") or a blobId, served with 200 as HTML
+    const fb = manifest.fallback.startsWith('/') ? manifest.routes[manifest.fallback] : manifest.fallback
+    if (fb) {
+      const blob = await fetchBlob(aggregator, fb)
+      if (blob) return new Response(blob.content, {
+        status: 200,
+        headers: {
+          'Content-Type':     'text/html; charset=utf-8',
+          'X-Epoch-Name':     `${name}.epoch`,
+          'X-Walrus-Blob-Id': fb,
+          'X-Epoch-Manifest': rootBlobId,
+          'Cache-Control':    'public, max-age=300',
+        },
+      })
+    }
+  }
+
   if (!target) {
     // site's custom 404, if present
     if (manifest.notFound) {
@@ -302,11 +647,16 @@ async function serveFromManifest(
         headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Epoch-Name': `${name}.epoch` },
       })
     }
-    return notFound(`No page at "${path}" on ${name}.epoch.`)
+    // Il sito esiste e questa pagina no: è un 404 legittimo, ma dentro un sito
+    // di qualcuno. Mandare qui "registra il tuo nome" sarebbe la stessa
+    // svista della pagina dei blob scaduti, in piccolo.
+    return noRoute(name, path)
   }
 
   const blob = await fetchBlob(aggregator, target)
-  if (!blob) return notFound(`Blob for "${path}" not found on Walrus.`)
+  // The route exists in the manifest, so the page was published: its bytes are
+  // just not being served. Same reasoning as the root blob above.
+  if (!blob) return siteUnavailable(name, path)
 
   return new Response(blob.content, {
     status:  200,
@@ -406,6 +756,34 @@ function notFound(msg: string): Response {
   })
 }
 
+/** The name is registered and owned, but its content cannot be fetched right now.
+ *
+ *  Two causes look identical from here: the Walrus storage expired, or the
+ *  aggregator is not serving those bytes at this moment. The page says both
+ *  instead of picking one, and 503 is deliberate: a 404 would tell crawlers the
+ *  site is gone, when the name is still owned and one renewal brings it back.
+ *  Retry-After keeps a temporary aggregator hiccup from looking permanent. */
+function siteUnavailable(name: string, path?: string): Response {
+  return new Response(siteUnavailablePage(escHtml(name), path ? escHtml(path) : null), {
+    status:  503,
+    headers: {
+      'Content-Type':  'text/html; charset=utf-8',
+      'Retry-After':   '3600',
+      'X-Epoch-Name':  `${name}.epoch`,
+      'Cache-Control': 'no-store',
+    },
+  })
+}
+
+/** Il nome esiste e il sito pure: manca solo quella pagina. 404 vero, ma con la
+ *  strada di casa invece dell'invito a registrare un nome che è già di qualcuno. */
+function noRoute(name: string, path: string): Response {
+  return new Response(noRoutePage(escHtml(name), escHtml(path)), {
+    status:  404,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Epoch-Name': `${name}.epoch` },
+  })
+}
+
 function errorResponse(msg: string): Response {
   return new Response(errorPage(escHtml(msg)), {
     status:  500,
@@ -413,119 +791,148 @@ function errorResponse(msg: string): Response {
   })
 }
 
-function notFoundPage(msg: string): string {
+/* ── Pagine di servizio ──────────────────────────────────────────
+   Stesso linguaggio visivo del sito names: sfondo #00050F, aurora blu e magenta
+   appena accennata, card col bordo in gradiente e l'interno scuro, logo a
+   clessidra. Chi finisce qui arriva quasi sempre da un link a un nome `.epoch`,
+   quindi deve capire al primo sguardo da chi sta ricevendo il messaggio. */
+
+const HOURGLASS = `<svg width="52" height="52" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="56" height="56" rx="16" fill="url(#g)"/>
+  <defs><linearGradient id="g" x1="0" y1="0" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+    <stop offset="0%" stop-color="#0D1F3C"/><stop offset="100%" stop-color="#091428"/>
+  </linearGradient></defs>
+  <path d="M18 12h20M18 44h20" stroke="#29B6F6" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M20 12 C20 12 20 22 28 28 C36 34 36 44 36 44 L20 44 C20 44 20 34 28 28 C36 22 36 12 20 12Z"
+        fill="rgba(41,182,246,0.12)" stroke="#29B6F6" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M36 12 C36 12 36 22 28 28 C20 34 20 44 20 44 L36 44 C36 44 36 34 28 28 C20 22 20 12 36 12Z"
+        fill="rgba(224,64,251,0.10)" stroke="#E040FB" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M22 16 Q28 24 34 16Z" fill="rgba(41,182,246,0.35)"/>
+  <ellipse cx="28" cy="40" rx="5" ry="2.5" fill="rgba(224,64,251,0.4)"/>
+  <line x1="28" y1="29" x2="28" y2="36" stroke="rgba(255,255,255,0.25)" stroke-width="1.5" stroke-linecap="round"/>
+</svg>`
+
+const PAGE_CSS = `
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif;
+    background: #00050F; color: #f4f4f5; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 2rem; position: relative; overflow-x: hidden;
+  }
+  body::before {
+    content: ''; position: fixed; inset: -20% -10% auto -10%; height: 60vh; pointer-events: none;
+    background:
+      radial-gradient(45% 55% at 30% 40%, rgba(41,182,246,0.16), transparent 70%),
+      radial-gradient(40% 50% at 70% 30%, rgba(224,64,251,0.13), transparent 70%);
+    filter: blur(20px);
+  }
+  .wrap { position: relative; width: 100%; max-width: 560px; }
+  .card-outer {
+    border-radius: 1.75rem; padding: 1px;
+    background: linear-gradient(135deg, rgba(41,182,246,0.45), rgba(224,64,251,0.45));
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+  }
+  .card {
+    border-radius: 1.75rem; padding: 3rem 2.25rem;
+    background: linear-gradient(180deg, #071023 0%, #040a18 100%);
+  }
+  .logo { margin-bottom: 1.4rem; display: flex; justify-content: center; }
+  .name { font-size: 1.75rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 0.4rem; }
+  .name span { color: #52525b; font-weight: 700; }
+  .eyebrow {
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase;
+    margin-bottom: 1.2rem;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 0.9rem; }
+  p { font-size: 0.9rem; color: #a1a1aa; line-height: 1.7; margin-bottom: 0.9rem; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: #d4d4d8;
+    background: rgba(255,255,255,0.05); padding: 0.2rem 0.45rem; border-radius: 0.4rem;
+  }
+  .foot {
+    font-size: 0.82rem; color: #71717a; line-height: 1.6;
+    border-top: 1px solid rgba(255,255,255,0.07); padding-top: 1.25rem; margin-top: 1.5rem;
+  }
+  .btn {
+    display: inline-block; margin-top: 0.85rem; padding: 0.7rem 1.6rem; border-radius: 0.9rem;
+    font-size: 0.85rem; font-weight: 700; text-decoration: none; color: #050b16;
+    background: linear-gradient(135deg, #29B6F6, #E040FB);
+    box-shadow: 0 10px 30px rgba(41,182,246,0.22); transition: filter .15s, transform .15s;
+  }
+  .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+  .link { color: #29B6F6; text-decoration: none; font-weight: 600; }
+`
+
+function pageShell(title: string, inner: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Not Found — Epoch Names</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #040d1a;
-      color: #e2e8f0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-      padding: 2rem;
-    }
-    .card {
-      max-width: 480px;
-      background: rgba(41,182,246,0.04);
-      border: 1px solid rgba(41,182,246,0.15);
-      border-radius: 1.5rem;
-      padding: 3rem 2.5rem;
-    }
-    .logo { margin-bottom: 1.5rem; }
-    h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; }
-    p { font-size: 0.9rem; color: #94a3b8; line-height: 1.6; margin-bottom: 1.5rem; }
-    .btn {
-      display: inline-block;
-      padding: 0.65rem 1.6rem;
-      background: linear-gradient(135deg, rgba(41,182,246,0.15), rgba(224,64,251,0.15));
-      border: 1px solid rgba(41,182,246,0.35);
-      border-radius: 0.75rem;
-      color: #6FBCF0;
-      text-decoration: none;
-      font-size: 0.85rem;
-      font-weight: 600;
-      transition: opacity 0.15s;
-    }
-    .btn:hover { opacity: 0.8; }
-  </style>
+  <meta name="robots" content="noindex">
+  <title>${title}</title>
+  <link rel="icon" href="https://names.epochsui.com/favicon.svg" type="image/svg+xml">
+  <style>${PAGE_CSS}</style>
 </head>
 <body>
-  <div class="card">
-    <div class="logo">
-      <svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <rect width="56" height="56" rx="16" fill="url(#g)"/>
-        <defs>
-          <linearGradient id="g" x1="0" y1="0" x2="56" y2="56" gradientUnits="userSpaceOnUse">
-            <stop offset="0%" stop-color="#0D1F3C"/>
-            <stop offset="100%" stop-color="#091428"/>
-          </linearGradient>
-        </defs>
-        <!-- hourglass body -->
-        <path d="M18 12h20M18 44h20" stroke="#29B6F6" stroke-width="2.5" stroke-linecap="round"/>
-        <path d="M20 12 C20 12 20 22 28 28 C36 34 36 44 36 44 L20 44 C20 44 20 34 28 28 C36 22 36 12 20 12Z"
-              fill="rgba(41,182,246,0.12)" stroke="#29B6F6" stroke-width="1.5" stroke-linejoin="round"/>
-        <path d="M36 12 C36 12 36 22 28 28 C20 34 20 44 20 44 L36 44 C36 44 36 34 28 28 C20 22 20 12 36 12Z"
-              fill="rgba(224,64,251,0.10)" stroke="#E040FB" stroke-width="1.5" stroke-linejoin="round"/>
-        <!-- sand top -->
-        <path d="M22 16 Q28 24 34 16Z" fill="rgba(41,182,246,0.35)"/>
-        <!-- sand bottom -->
-        <ellipse cx="28" cy="40" rx="5" ry="2.5" fill="rgba(224,64,251,0.4)"/>
-        <!-- falling grain -->
-        <line x1="28" y1="29" x2="28" y2="36" stroke="rgba(255,255,255,0.25)" stroke-width="1.5" stroke-linecap="round"/>
-      </svg>
-    </div>
-    <h1>Site Not Found</h1>
-    <p>${msg}</p>
-    <p>Register your <strong style="color:#e2e8f0">.epoch</strong> name and publish your site at</p>
-    <a class="btn" href="https://names.epochsui.com/build">names.epochsui.com/build</a>
+  <div class="wrap">
+    <div class="card-outer"><div class="card">
+      <div class="logo">${HOURGLASS}</div>
+      ${inner}
+    </div></div>
   </div>
 </body>
 </html>`
 }
 
+function siteUnavailablePage(name: string, path: string | null): string {
+  const what = path ? `The page <code>${path}</code> of this site` : 'This site'
+  return pageShell(`${name}.epoch, content unavailable`, `
+      <div class="name">${name}<span>.epoch</span></div>
+      <div class="eyebrow" style="color:#FBBF24">Content unavailable</div>
+      <p>${what} is not being served right now. Two things cause this: the Walrus storage
+         behind it reached the end of its paid period, or the storage network is not
+         returning those bytes at the moment.</p>
+      <p>The name is registered and owned. Nothing on chain was lost: publishing the site again
+         brings it back exactly as it was, and the name keeps pointing at it.</p>
+      <div class="foot">
+        If this name is yours, open your sites: extend the storage while the paid period is still
+        running, publish again once it is over.
+        <br>
+        <a class="btn" href="https://names.epochsui.com/profile?tab=renewal">Open renewal</a>
+      </div>`)
+}
+
+function noRoutePage(name: string, path: string): string {
+  return pageShell(`${name}.epoch, page not found`, `
+      <div class="name">${name}<span>.epoch</span></div>
+      <div class="eyebrow" style="color:#29B6F6">Page not found</div>
+      <p>This site does not have a page at <code>${path}</code>.</p>
+      <div class="foot">
+        The rest of the site is there.
+        <br>
+        <a class="btn" href="/">Go to the homepage</a>
+      </div>`)
+}
+
+function notFoundPage(msg: string): string {
+  return pageShell('Not found, Epoch Names', `
+      <h1>Site not found</h1>
+      <p>${msg}</p>
+      <div class="foot">
+        Register your <strong style="color:#f4f4f5">.epoch</strong> name and publish a site in minutes.
+        <br>
+        <a class="btn" href="https://names.epochsui.com/build">Register a name</a>
+      </div>`)
+}
+
 function errorPage(msg: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Error — Epoch Sites</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #040d1a; color: #e2e8f0;
-      min-height: 100vh; display: flex;
-      align-items: center; justify-content: center;
-      text-align: center; padding: 2rem;
-    }
-    .card {
-      max-width: 480px;
-      background: rgba(239,68,68,0.05);
-      border: 1px solid rgba(239,68,68,0.2);
-      border-radius: 1.5rem; padding: 3rem 2.5rem;
-    }
-    .icon { font-size: 3rem; margin-bottom: 1.5rem; }
-    h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; }
-    p { font-size: 0.875rem; color: #94a3b8; line-height: 1.6; }
-    code { font-family: monospace; font-size: 0.8rem;
-           background: rgba(255,255,255,0.05); padding: 0.2rem 0.4rem; border-radius: 0.25rem; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">⚠️</div>
-    <h1>Something went wrong</h1>
-    <p><code>${msg}</code></p>
-  </div>
-</body>
-</html>`
+  return pageShell('Error, Epoch Sites', `
+      <h1>Something went wrong</h1>
+      <p>This is on our side, not yours. The name and its content are untouched.</p>
+      <p><code>${msg}</code></p>
+      <div class="foot">
+        If it keeps happening, tell us on <a class="link" href="https://x.com/EpochSui">X</a>.
+      </div>`)
 }

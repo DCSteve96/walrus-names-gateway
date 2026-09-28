@@ -12,6 +12,7 @@
     "wrangler": "^3.0.0"
   },
   "dependencies": {
-    "@mysten/sui": "^2.22.1"
+    "@mysten/sui": "^2.22.1",
+    "qrcode": "^1.5.4"
   }
 }

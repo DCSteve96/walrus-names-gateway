@@ -14,3 +14,37 @@ compatibility_date = "2024-09-23"
 
 [vars]
 NETWORK = "mainnet"   # "mainnet" | "testnet"
+# Card PNG dei nomi: Supabase Edge Function `og-name` (satori + resvg-wasm),
+# sorgente in supabase/functions/og-name. Il Worker fa solo proxy + cache.
+OG_RENDERER = "https://bgbyobyqzxmycatboyug.supabase.co/functions/v1/og-name"
+# Publishable key (read only, the same one shipped in the frontends): the OG
+# preview of claim.epochsui.com/<drop> reads the creator's banner from `drop_meta`.
+SUPABASE_ANON = "sb_publishable_q92VnPJFVf9TGITNoe3NBQ_ypQCnCu4"
+# Anteprime delle bozze del builder su preview.<dominio>. Usato solo se manca il
+# service binding qui sotto.
+DRAFT_ORIGIN = "https://epoch-walrus.pupazzipunkapi.workers.dev"
+# Letture della farm su farm.<dominio>. Usato solo se manca il service binding.
+FARM_ORIGIN = "https://epoch-farm.pupazzipunkapi.workers.dev"
+# Facilitator x402 su x402.<dominio>. Usato solo se manca il service binding.
+X402_ORIGIN = "https://epoch-x402.pupazzipunkapi.workers.dev"
+
+# Epoch-specific: il worker delle bozze sta nello stesso account, e le fetch
+# worker→worker via workers.dev lì vengono bloccate, quindi si passa di qui.
+# **Chi si auto-ospita questo gateway deve togliere questo blocco**, altrimenti
+# `wrangler deploy` non trova il servizio: senza binding la rotta preview usa
+# DRAFT_ORIGIN.
+[[services]]
+binding = "WALRUS"
+service = "epoch-walrus"
+
+# Stessa storia per la farm: farm.epochsui.com serve solo /state e /proof/<addr>
+# del worker `epoch-farm`. Senza binding la rotta usa FARM_ORIGIN.
+[[services]]
+binding = "FARM"
+service = "epoch-farm"
+
+# Facilitator x402: x402.epochsui.com inoltra tutto al worker `epoch-x402`
+# (verify, settle, supported, demo). Senza binding la rotta usa X402_ORIGIN.
+[[services]]
+binding = "X402"
+service = "epoch-x402"

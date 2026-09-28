@@ -48,9 +48,12 @@ A multi-page site is one JSON blob:
     "/about":     "<blobId>",
     "/style.css": "<blobId>"
   },
-  "404": "<blobId>"
+  "404": "<blobId>",
+  "fallback": "/"
 }
 ```
+
+`404` is an optional custom not-found page. `fallback` (optional) is for single-page apps: any unknown extension-less path (e.g. `/session/3`) serves that route (or blobId) with a real 200, so client-side routers work and share previews resolve.
 
 Any non-JSON blob (or JSON without `epoch-manifest`) is served as a classic single-page site — full backwards compatibility. You don't need to craft manifests by hand: the no-code builder at [names.epochsui.com/build](https://names.epochsui.com/build) generates and publishes them (multi-page, asset upload, .zip import).
 
