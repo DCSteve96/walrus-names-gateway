@@ -256,7 +256,9 @@ export default {
       const id = url.pathname.replace(/^\/+/, '')
       // Blob id base64url: se non lo è, non è una nostra richiesta e non la si
       // gira a nessuno. Niente path, niente query, niente da inoltrare.
-      if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) {
+      // Oppure "<quilt id>/<identificatore>": un file di un sito in quilt, letto
+      // per nome (l'editor lo usa per riaprire quei siti).
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(id) && !/^[A-Za-z0-9_-]{43}\/[A-Za-z0-9._~:-]{1,200}$/.test(id)) {
         return Response.redirect('https://names.epochsui.com', 302)
       }
       const origin = (env.DRAFT_ORIGIN || 'https://epoch-walrus.pupazzipunkapi.workers.dev').replace(/\/+$/, '')
@@ -528,12 +530,43 @@ export default {
 
 /* ── Walrus fetch ────────────────────────────────────────────── */
 
+/* Tre modi di indicare un contenuto su Walrus (30 set 2026, siti in quilt):
+ *   <blob id>            43 caratteri: un blob intero           -> /v1/blobs/<id>
+ *   <patch id>           50 caratteri: un file dentro un quilt  -> /v1/blobs/by-quilt-patch-id/<id>
+ *   quilt:<quilt>/<ident>  un file di un quilt per identificatore -> /v1/blobs/by-quilt-id/<quilt>/<ident>
+ * I siti pubblicati con lo sponsor sono UN quilt: il nome punta al patch id del
+ * manifest, e le route "@<ident>" del manifest sono file dello stesso quilt. */
+const PATCH_ID_RE = /^[A-Za-z0-9_-]{50}$/
+
+function walrusPath(id: string): string {
+  if (id.startsWith('quilt:')) {
+    const [quilt, ...rest] = id.slice('quilt:'.length).split('/')
+    return `/v1/blobs/by-quilt-id/${quilt}/${encodeURIComponent(rest.join('/'))}`
+  }
+  return PATCH_ID_RE.test(id) ? `/v1/blobs/by-quilt-patch-id/${id}` : `/v1/blobs/${id}`
+}
+
+/** L'id del quilt che contiene una patch (i primi 32 dei 37 byte del patch id). */
+function quiltOfPatch(id: string): string | null {
+  if (!PATCH_ID_RE.test(id)) return null
+  const raw = atob(id.replace(/-/g, '+').replace(/_/g, '/') + '==')
+  if (raw.length !== 37) return null
+  return btoa(raw.slice(0, 32)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/** Una voce del manifest in un id leggibile: "@ident" è un file dello stesso quilt del manifest. */
+function resolveRef(value: string, rootBlobId: string): string | null {
+  if (!value.startsWith('@')) return value
+  const quilt = quiltOfPatch(rootBlobId)
+  return quilt ? `quilt:${quilt}/${value.slice(1)}` : null
+}
+
 async function fetchBlob(
   aggregator: string,
   blobId:     string,
 ): Promise<{ content: ArrayBuffer; contentType: string | null } | null> {
   try {
-    const res = await fetch(`${aggregator}/v1/blobs/${blobId}`, {
+    const res = await fetch(`${aggregator}${walrusPath(blobId)}`, {
       headers: { 'User-Agent': 'walrus-names-gateway/1.0' },
     })
     if (!res.ok) return null
@@ -622,7 +655,8 @@ async function serveFromManifest(
 
   if (!target && manifest.fallback && !path.includes('.')) {
     // SPA fallback: a route path ("/") or a blobId, served with 200 as HTML
-    const fb = manifest.fallback.startsWith('/') ? manifest.routes[manifest.fallback] : manifest.fallback
+    const fbRaw = manifest.fallback.startsWith('/') ? manifest.routes[manifest.fallback] : manifest.fallback
+    const fb = fbRaw ? resolveRef(fbRaw, rootBlobId) : null
     if (fb) {
       const blob = await fetchBlob(aggregator, fb)
       if (blob) return new Response(blob.content, {
@@ -640,8 +674,9 @@ async function serveFromManifest(
 
   if (!target) {
     // site's custom 404, if present
-    if (manifest.notFound) {
-      const nf = await fetchBlob(aggregator, manifest.notFound)
+    const nfId = manifest.notFound ? resolveRef(manifest.notFound, rootBlobId) : null
+    if (nfId) {
+      const nf = await fetchBlob(aggregator, nfId)
       if (nf) return new Response(nf.content, {
         status: 404,
         headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Epoch-Name': `${name}.epoch` },
@@ -653,7 +688,8 @@ async function serveFromManifest(
     return noRoute(name, path)
   }
 
-  const blob = await fetchBlob(aggregator, target)
+  const targetId = resolveRef(target, rootBlobId)
+  const blob = targetId ? await fetchBlob(aggregator, targetId) : null
   // The route exists in the manifest, so the page was published: its bytes are
   // just not being served. Same reasoning as the root blob above.
   if (!blob) return siteUnavailable(name, path)
@@ -663,7 +699,7 @@ async function serveFromManifest(
     headers: {
       'Content-Type':              mimeFromPath(path),
       'X-Epoch-Name':              `${name}.epoch`,
-      'X-Walrus-Blob-Id':          target,
+      'X-Walrus-Blob-Id':          targetId ?? target,
       'X-Epoch-Manifest':          rootBlobId,
       'Cache-Control':             'public, max-age=300',
       'Access-Control-Allow-Origin': '*',
