@@ -2,6 +2,17 @@ name            = "walrus-names-gateway"
 main            = "src/index.ts"
 compatibility_date = "2024-09-23"
 
+# Route della zona. La prima è quella di sempre (i sottodomini). La seconda prende
+# gli hostname che NON sono della zona: i domini custom dei siti .epoch, che
+# arrivano qui via Cloudflare for SaaS (fallback origin cname.epochsui.com).
+# Il pannello non accetta `*/*`, l'API sì: per questo sta qui e non nella
+# dashboard. Nella zona c'è anche `epochsui.com/*` → nessun worker, messo a mano,
+# che tiene l'apex fuori da `*/*`.
+routes = [
+  { pattern = "*.epochsui.com/*", zone_name = "epochsui.com" },
+  { pattern = "*/*",              zone_name = "epochsui.com" },
+]
+
 # Self-hosting on YOUR domain:
 #   1. `wrangler deploy`
 #   2. In Cloudflare DNS, add a wildcard record:
@@ -14,6 +25,11 @@ compatibility_date = "2024-09-23"
 
 [vars]
 NETWORK = "mainnet"   # "mainnet" | "testnet"
+# Domini custom (5 ott 2026): ogni hostname che NON sta sotto questo dominio è il
+# dominio di qualcuno, puntato qui via Cloudflare for SaaS, e si risolve nella
+# tabella pubblica `custom_domains` (letta con SUPABASE_ANON). Chi si auto-ospita
+# il gateway lascia vuoto e la funzione è spenta.
+BASE_DOMAIN = "epochsui.com"
 # Card PNG dei nomi: Supabase Edge Function `og-name` (satori + resvg-wasm),
 # sorgente in supabase/functions/og-name. Il Worker fa solo proxy + cache.
 OG_RENDERER = "https://bgbyobyqzxmycatboyug.supabase.co/functions/v1/og-name"

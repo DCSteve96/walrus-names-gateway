@@ -36,6 +36,12 @@ export interface Env {
   X402_ORIGIN?: string
   /** Service binding to the facilitator worker, preferred over X402_ORIGIN when present. */
   X402?: { fetch: (req: Request) => Promise<Response> }
+  /** Our own domain (e.g. "epochsui.com"). Any other hostname reaching this worker
+   *  is a custom domain pointed here through Cloudflare for SaaS, resolved via the
+   *  public `custom_domains` table. Leave it unset to turn custom domains off. */
+  BASE_DOMAIN?: string
+  /** Supabase project URL for the custom_domains lookup (read with SUPABASE_ANON). */
+  SUPABASE_URL?: string
 }
 
 /* ── On-chain constants ──────────────────────────────────────── */
@@ -108,7 +114,17 @@ function generateOgImage(name: string): Response {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url      = new URL(request.url)
-    const hostname = url.hostname  // e.g. "esempio.epochsui.com"
+    const hostname = url.hostname.toLowerCase()  // e.g. "esempio.epochsui.com"
+
+    // Custom domains (5 Oct 2026): a hostname outside our own domain is someone's
+    // domain, CNAMEd to this zone through Cloudflare for SaaS. The mapping
+    // hostname → name lives in a public Supabase table, read with the anon key
+    // like `drop_meta`: no secret here, and a self-hosted gateway skips all of
+    // this by leaving BASE_DOMAIN empty.
+    const base = (env.BASE_DOMAIN ?? '').trim().toLowerCase().replace(/^\.+/, '')
+    if (base && hostname !== base && !hostname.endsWith(`.${base}`)) {
+      return serveCustomDomain(env, url, hostname)
+    }
 
     // OG image route: og.epochsui.com/:name or /og/:name
     if (hostname.startsWith('og.') || url.pathname.startsWith('/og/')) {
@@ -157,6 +173,7 @@ export default {
       'www', 'mail', 'webmail', 'autoconfig', 'autodiscover',
       'smtp', 'imap', 'pop', 'pop3', 'mx', 'ftp', 'ns1', 'ns2',
       'api', 'cpanel', 'og', 'indexer',
+      'cname',   // CNAME target for custom domains (Cloudflare for SaaS fallback origin)
     ])
     if (RESERVED.has(name)) {
       return Response.redirect('https://epochsui.com', 301)
@@ -170,6 +187,20 @@ export default {
       const target = new URL(request.url)
       target.hostname = 'epoch-mcp.pupazzipunkapi.workers.dev'
       return fetch(new Request(target.toString(), request))
+    }
+
+    // id.epochsui.com: the signed-in edition of the MCP server (OAuth with a
+    // wallet signature as the login). Same worker: it tells the two apart by
+    // the original host, which this proxy passes along. Two letters cannot be
+    // a .epoch name (three minimum), so nothing is taken from anyone.
+    // NOTE: Epoch-specific infrastructure — remove this block when self-hosting.
+    if (name === 'id') {
+      const target = new URL(request.url)
+      target.hostname = 'epoch-mcp.pupazzipunkapi.workers.dev'
+      const h = new Headers(request.headers)
+      h.set('X-Forwarded-Host', hostname)
+      // Redirects (the /authorize hop to the sign-in page) must reach the browser as they are.
+      return fetch(new Request(target.toString(), { method: request.method, headers: h, body: request.body, redirect: 'manual' }))
     }
 
     // Verified Vault badge: transparent proxy to the epoch-badge Worker.
@@ -455,6 +486,75 @@ export default {
       return new Response(res.body, { status: res.status, headers: h })
     }
 
+    return serveName(env, url, name)
+  },
+}
+
+/* ── Custom domains ──────────────────────────────────────────── */
+
+interface CustomDomainRow { name: string; expired: boolean; verification: Array<{ path: string; body: string }> }
+
+/** hostname → row of `custom_domains`, or null. Cached at the edge for five
+ *  minutes (a miss for one), the same horizon as the sites themselves. */
+async function lookupCustomDomain(env: Env, hostname: string): Promise<CustomDomainRow | null> {
+  if (!env.SUPABASE_ANON || hostname.length > 253 || !/^[a-z0-9.-]+$/.test(hostname)) return null
+  const cache = (caches as any).default as Cache
+  const key = new Request(`https://custom-domains.invalid/${hostname}`, { method: 'GET' })
+  const hit = await cache.match(key)
+  if (hit) {
+    const j = await hit.json() as { row: CustomDomainRow | null }
+    return j.row
+  }
+  let row: CustomDomainRow | null = null
+  try {
+    const sb = (env.SUPABASE_URL || 'https://bgbyobyqzxmycatboyug.supabase.co').replace(/\/+$/, '')
+    const r = await fetch(`${sb}/rest/v1/custom_domains?select=name,verification,status&domain=eq.${encodeURIComponent(hostname)}&status=in.(pending,active,expired)`,
+      { headers: { apikey: env.SUPABASE_ANON, Authorization: `Bearer ${env.SUPABASE_ANON}` }, signal: AbortSignal.timeout(4000) })
+    if (!r.ok) return null // table unreachable: no caching of a transient failure
+    const rows = await r.json() as Array<{ name: string; status?: string; verification?: unknown }>
+    const first = rows[0]
+    if (first && isValidName(String(first.name))) {
+      const ver = Array.isArray(first.verification) ? first.verification : []
+      row = {
+        name: String(first.name),
+        expired: first.status === 'expired',
+        verification: ver.filter((v: any) => typeof v?.path === 'string' && typeof v?.body === 'string')
+          .map((v: any) => ({ path: String(v.path), body: String(v.body) })),
+      }
+    }
+  } catch { return null }
+  const res = new Response(JSON.stringify({ row }), { headers: { 'Cache-Control': row ? 'public, max-age=300' : 'public, max-age=60' } })
+  await cache.put(key, res)
+  return row
+}
+
+async function serveCustomDomain(env: Env, url: URL, hostname: string): Promise<Response> {
+  const row = await lookupCustomDomain(env, hostname)
+  if (!row) {
+    return new Response(domainNotConnectedPage(escHtml(hostname)), {
+      status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
+  }
+  // Cloudflare's hostname and certificate checks fetch a token over plain HTTP
+  // at a /.well-known/ path. The worker that created the hostname stored those
+  // tokens on the row, so they are answered here even though every request on
+  // this host ends up in this gateway.
+  if (url.pathname.startsWith('/.well-known/')) {
+    const v = row.verification.find(x => x.path === url.pathname)
+    if (v) return new Response(v.body, { headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } })
+  }
+  // The year ran out and the grace week with it. The hostname stays up for a
+  // while so whoever lands here learns why, instead of a certificate error.
+  if (row.expired) {
+    return new Response(domainExpiredPage(escHtml(hostname), escHtml(row.name)), {
+      status: 410, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Epoch-Name': `${row.name}.epoch` },
+    })
+  }
+  return serveName(env, url, row.name)
+}
+
+/** Serve the site of a `.epoch` name at whatever path `url` asks for. */
+async function serveName(env: Env, url: URL, name: string): Promise<Response> {
     const network = (env.NETWORK === 'mainnet' ? 'mainnet' : 'testnet') as 'mainnet' | 'testnet'
     const cfg     = CONTRACTS[network]
 
@@ -525,7 +625,6 @@ export default {
         'Access-Control-Allow-Origin': '*',
       },
     })
-  },
 }
 
 /* ── Walrus fetch ────────────────────────────────────────────── */
@@ -960,6 +1059,33 @@ function notFoundPage(msg: string): string {
         Register your <strong style="color:#f4f4f5">.epoch</strong> name and publish a site in minutes.
         <br>
         <a class="btn" href="https://names.epochsui.com/build">Register a name</a>
+      </div>`)
+}
+
+function domainNotConnectedPage(host: string): string {
+  return pageShell('Domain not connected, Epoch Names', `
+      <h1>This domain is not connected yet</h1>
+      <p><code>${host}</code> points at Epoch Names, but no <strong style="color:#f4f4f5">.epoch</strong>
+         site is attached to it. If you just set it up, give it a few minutes.</p>
+      <div class="foot">
+        A .epoch site can answer on your own domain: connect it from your profile.
+        <br>
+        <a class="btn" href="https://names.epochsui.com/profile?tab=domains">Connect a domain</a>
+      </div>`)
+}
+
+function domainExpiredPage(host: string, name: string): string {
+  return pageShell(`${host}, plan ended`, `
+      <div class="name">${name}<span>.epoch</span></div>
+      <div class="eyebrow" style="color:#FBBF24">Domain plan ended</div>
+      <p>The yearly plan that connected <code>${host}</code> to this site has run out.
+         The site itself is fine and still answers at its .epoch address.</p>
+      <p><a class="link" href="https://${name}.epochsui.com">Open ${name}.epochsui.com</a></p>
+      <div class="foot">
+        If this domain is yours, renew it from your profile: the site comes back on this address within minutes,
+        with nothing to change at your DNS provider.
+        <br>
+        <a class="btn" href="https://names.epochsui.com/profile?tab=domains">Renew the domain</a>
       </div>`)
 }
 
